@@ -22,7 +22,7 @@ The main window, top to bottom: the **Download Queue** (here with three example 
 | **📋 Double Buffer Queue** | A batch reads its queue from `.processing.list` while `list.txt` is released immediately, so a URL that a script appends to `list.txt` during a batch is kept for the next round. `list.txt` is the GUI's own saved list, though: while the window is open, edit the list in the window, not the file (see the FAQ). |
 | **🔁 Smart Retry & Error Isolation** | Each URL is tried up to 3 times in total (the first try plus 2 retries, 5 s apart; change it under Settings → Advanced → Max Attempts). Errors that retrying cannot fix are not retried. If the network is down (3 URLs in a row fail that way), the batch stops and those URLs stay in the list instead of ending up in `failed_list.txt`. On failure, the URL is appended to `failed_list.txt` without blocking the remaining downloads. |
 | **🔒 Single Instance Protection** | OS-level file lock (`flock`) prevents duplicate processes from corrupting files. |
-| **⬆️ Auto-update yt-dlp** | Checks for yt-dlp updates once at GUI startup, in the background (Download is enabled when it finishes), to maintain X platform compatibility. |
+| **⬆️ Auto-update yt-dlp** | Checks for yt-dlp updates once at GUI startup, in the background (Download is enabled when it finishes), to keep downloads working. |
 | **🛡️ Argument Injection Protection** | The `--` separator ends yt-dlp's option parsing, so nothing in the URL list can be read as an option (for example `--exec`). |
 | **💾 Atomic Writes** | Queue updates use "write-to-temp, then atomic replace" — `.processing.list` is never zeroed out mid-write. |
 | **🔌 Extensible Config & Hooks** | Sites, languages, download settings and post-download hooks each have a documented extension point: see [How to extend](#how-to-extend). |
@@ -66,17 +66,23 @@ On aarch64 the bundle has only been run under emulation, up to the main window.
 This tool needs your X (Twitter) session cookie to access restricted videos. Anyone who has that cookie can use your
 account: see the [Security Warning](#security-warning).
 
+> ⚠️ **Account risk:** X's [Terms of Service](https://x.com/en/tos) forbid accessing X by automated means other than
+> through X's published interfaces, and X may suspend the account of anyone who breaks them. This tool is not one of
+> those interfaces, so it can get the account you log in with suspended: use an account you can afford to lose.
+
 **Recommended:** simply log into x.com in Firefox, Chrome, Chromium, Brave, Opera, Edge or Vivaldi.
 The downloader finds the browser profile that holds the login automatically (Firefox: classic, XDG
 `~/.config/mozilla/firefox`, Snap and Flatpak locations are supported).
 
 **Alternative:** provide a `cookies.txt` in **Netscape HTTP Cookie** format (must contain `auth_token` and `ct0`).
 
-**Recommended browser extensions for export:**
+**Browser extensions for export** (examples, not endorsements):
 - Chrome: [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
 - Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
 
-Export the file, name it `cookies.txt`, and place it in the project root.
+Such an extension can read your browser's cookies, that is, your logins: install one only if you trust it.
+
+Export the file, name it `cookies.txt`, and place it in the project root. Then remove the extension again.
 
 ### Step 2: Launch the GUI
 
@@ -381,14 +387,18 @@ X-Downloader is distributed in the hope that it will be useful, but WITHOUT ANY 
 warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 You should have received a copy of it in [LICENSE](LICENSE); if not, see <https://www.gnu.org/licenses/>.
 
-This covers the code in this repository. The bundled runtime in `bundled-runtime/` redistributes third-party software
+This covers everything original in this repository (the code, the documentation and the screenshots), including files
+that carry no license notice of their own. The bundled runtime in `bundled-runtime/` redistributes third-party software
 under its own licenses (see `bundled-runtime/README.md`); `yt-dlp` and FFmpeg are downloaded on first use and keep
 theirs.
 
 ## Disclaimer
 
-This project is provided strictly for personal educational and technical research purposes and has no official
-affiliation with X Corp. All media content downloaded through this tool remains the intellectual property of its
-respective creators and must not be used for commercial purposes or unauthorized distribution. Users are solely
-responsible for complying with applicable local laws and X's Terms of Service. The user assumes full responsibility for
-any legal liabilities or account risks resulting from the use of this tool, and the developer disclaims all liability.
+X-Downloader is intended for personal, educational and technical-research use. That is a statement of intent, not a
+condition of its license, which is the GNU GPL version 3 alone (see [License](#license)). This project has no official
+affiliation with X Corp. X and Twitter are trademarks of X Corp. All media content downloaded through this tool remains
+the intellectual property of its respective creators and must not be used for commercial purposes or unauthorized
+distribution. Users are solely responsible for complying with applicable local laws and X's Terms of Service. To the
+extent permitted by applicable law, the user assumes full responsibility for any legal liabilities or account risks
+resulting from the use of this tool, and the developer disclaims all liability. Sections 15 through 17 of the GNU GPL
+version 3 (see [LICENSE](LICENSE)), on warranty and liability, apply as well.
