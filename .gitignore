@@ -1,0 +1,62 @@
+# X-Downloader .gitignore: an ALLOW-LIST. Everything is ignored unless a "!" line below lists it.
+#
+# Why: a deny-list can only name the files somebody thought of (cookies.txt, settings.json ...). A cookie
+# export called x.com_cookies.txt, a .env, a screenshot or a log slipped through, and "git add ." would have
+# published a login session. With an allow-list a file nobody listed is never picked up by "git add ." or
+# "git add -A": forgetting an entry means a file is NOT committed (you notice at once), never a leak.
+#
+# To track a new kind of file, add a "!" line for it. tests/test_secret_guard.py fails when a tracked file is
+# not covered here, and when a file of an unknown kind would be picked up.
+#
+# What the program writes into this folder, all ignored by the first rule: cookies.txt and cookies_<domain>.txt
+# (session tokens!), settings.json, list.txt, failed_list.txt, *.log, .processing.list, downloader.lock, the
+# downloaded videos, yt-dlp and ffmpeg (auto-downloaded), .runtime/ (the unpacked runtime) and .tmp/.
+/*
+
+!/.gitignore
+!/.worktreeinclude
+!/start_gui.sh
+!/LICENSE*
+!/requirements.txt
+!/*.md
+
+# Folders are allowed, but inside them only these kinds of file.
+!/bundled-runtime/
+/bundled-runtime/*
+!/bundled-runtime/README.md
+!/bundled-runtime/linux-*.tar.gz
+
+# The screenshots of the README: PNGs directly in docs/images/, nothing else in docs/. tools/check-secrets.sh lets
+# exactly these paths through as binary files; change the two together.
+!/docs/
+/docs/*
+!/docs/images/
+/docs/images/*
+!/docs/images/*.png
+
+!/openspec/
+/openspec/**
+!/openspec/**/
+!/openspec/config.yaml
+!/openspec/**/.openspec.yaml
+!/openspec/**/*.md
+!/openspec/**/.gitkeep
+
+!/tests/
+/tests/*
+!/tests/*.py
+
+!/tools/
+/tools/*
+!/tools/*.sh
+!/tools/githooks/
+/tools/githooks/*
+!/tools/githooks/pre-*
+
+!/xdownloader/
+/xdownloader/*
+!/xdownloader/*.py
+
+# Publish: the agent rules stay in the private development repo. These two lines keep them out of "git add" when a local copy is recreated.
+/AGENTS.md
+/CLAUDE.md

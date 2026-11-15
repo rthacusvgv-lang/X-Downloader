@@ -1,0 +1,9 @@
+# The Python packages tools/build-runtime.sh puts into the bundled runtime, installed with --require-hashes: a rebuild
+# can only install exactly these wheels. To update one, change its version and its hash together (the SHA-256 of the
+# .whl file, listed at https://pypi.org/project/<name>/<version>/#files); PACKAGES.txt in the bundle shows what is in it.
+customtkinter==6.0.0 \
+    --hash=sha256:704fcbf1d2fca06bd7881b0afacfae72aed9864c9b6de2870e632e55eb3a0456
+darkdetect==0.8.0 \
+    --hash=sha256:a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c

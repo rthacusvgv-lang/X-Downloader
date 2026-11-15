@@ -1,0 +1,6 @@
+#!/bin/sh
+# Refuses a commit that stages a login. tools/check-secrets.sh looks at the content, not at the file name.
+# Enable once per clone:  git config core.hooksPath tools/githooks
+root=$(git rev-parse --show-toplevel) || exit 1
+# T (type change): a tracked link replaced by a file is new content too.
+git -c core.quotepath=off diff --cached --no-color --no-ext-diff -U0 --diff-filter=ACMRT | sh "$root/tools/check-secrets.sh"
