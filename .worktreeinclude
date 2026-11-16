@@ -1,8 +1,0 @@
-# 建立 worktree 時，要從主專案複製過去的「被 git 忽略」的檔案（gitignore 語法）。
-# 只有「同時符合這裡的規則、且確實被 .gitignore 忽略」的檔案才會複製。
-.env
-.env.local
-.env.*.local
-# .claude/settings.local.json
-# config/secrets.json
-# 不建議列入 node_modules、dist 等大型或可重建的目錄：請在各 worktree 內重新安裝/建置。
