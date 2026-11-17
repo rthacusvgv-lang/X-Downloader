@@ -14,11 +14,11 @@
 /*
 
 !/.gitignore
-!/.worktreeinclude
+
 !/start_gui.sh
 !/LICENSE*
 !/requirements.txt
-!/*.md
+!/*.README.md
 
 # Folders are allowed, but inside them only these kinds of file.
 !/bundled-runtime/
@@ -34,13 +34,7 @@
 /docs/images/*
 !/docs/images/*.png
 
-!/openspec/
-/openspec/**
-!/openspec/**/
-!/openspec/config.yaml
-!/openspec/**/.openspec.yaml
-!/openspec/**/*.md
-!/openspec/**/.gitkeep
+
 
 !/tests/
 /tests/*
