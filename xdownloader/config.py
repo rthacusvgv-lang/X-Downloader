@@ -113,7 +113,9 @@ class Config:
             if isinstance(data, dict):
                 cls.MISSING_DOWNLOAD_DIR = None
                 d = data.get("download_dir")
-                if d and isinstance(d, str) and d.replace("\x00", "").strip():
+                if d == "":                         # the project folder, wherever it is now (see save_settings)
+                    cls.DOWNLOAD_DIR = cls.BASE_PATH
+                elif d and isinstance(d, str) and d.replace("\x00", "").strip():
                     exp = cls.resolve_path(d)
                     if os.path.isdir(exp):
                         cls.DOWNLOAD_DIR = exp
@@ -134,8 +136,10 @@ class Config:
     @classmethod
     def save_settings(cls) -> bool:
         """Persists current user settings atomically with 0600 permissions; False if that failed."""
+        folder = cls.MISSING_DOWNLOAD_DIR or cls.DOWNLOAD_DIR
         data = {
-            "download_dir": cls.MISSING_DOWNLOAD_DIR or cls.DOWNLOAD_DIR,
+            # The project folder is saved as "", not as a path: a copied, moved or renamed project then uses its own.
+            "download_dir": "" if folder == cls.BASE_PATH else folder,
             "max_retries": cls.MAX_RETRIES,
             "merge_format": cls.MERGE_FORMAT,
             "language": cls.LANGUAGE,

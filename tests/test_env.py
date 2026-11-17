@@ -1,6 +1,7 @@
 """env.py: finding, downloading and updating yt-dlp and ffmpeg."""
 import hashlib
 import io
+import logging
 import os
 import subprocess
 import sys
@@ -11,7 +12,10 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from common import Base, Config, DownloaderCore, EnvManager, PROJECT
+from common import (
+    Base, Config, DownloaderCore, DownloadThread, EnvManager, PROJECT, ProcessManager, ShutdownRequested, read_calls,
+    write_fake_ytdlp,
+)
 
 
 class TestEnvManager(Base):
@@ -245,6 +249,109 @@ class TestDownloadedToolsMatchTheirChecksums(Base):
                                                 "/latest/checksums.sha256": self.checksums(name, listed)}) + f"/latest/{name}"
                 self.assertEqual(EnvManager(self.log)._download_ffmpeg(), installed)
                 self.assertEqual(os.path.exists(Config.FFMPEG_EXE), installed)
+
+
+class TestTheUpdateSaysWhatHappened(Base):
+    """When the update to the nightly channel failed, a second `yt-dlp -U` ran, and if that worked the log said "update
+    check complete (stable)". The program only installs nightly builds, whose -U stays on nightly (yt-dlp --help):
+    it was the same update again, under a wrong name, and its first failure was never shown."""
+
+    def test_a_failed_update_is_tried_once_and_reported(self):
+        write_fake_ytdlp("""\
+            echo "$@" >> "$(dirname "$0")/calls.log"
+            case " $* " in *" nightly "*) echo "ERROR: Unable to check for updates: HTTP Error 403" >&2; exit 1 ;; esac
+            exit 0""")
+        with self.assertLogs(self.log, "INFO") as logs:
+            EnvManager(self.log).update_yt_dlp()
+        self.assertEqual(len(read_calls(self.base)), 1)
+        self.assertEqual([line for line in logs.output if "stable" in line], [])
+        self.assertTrue(any("update failed" in line and "HTTP Error 403" in line for line in logs.output), logs.output)
+
+
+class TestStopWhileTheToolsAreFetched(Base):
+    """The first batch fetches yt-dlp and ffmpeg (about 200 MB). Stop did nothing meanwhile: the download ran to its end,
+    ffmpeg was fetched after it, and the log then said "yt-dlp download failed" although yt-dlp had been installed
+    (measured: Stop at 1 s of an 8 s download took effect after 7 s). Stopped while the new program was tried, it was
+    left installed without that try, which on Alpine and NixOS means without the script that lets it start at all."""
+    PROGRAM = b"#!/bin/sh\necho 1.0\n" + b"#" * 4096 + b"\n"
+
+    def setUp(self):
+        super().setUp()
+        ProcessManager.clear_cancel()
+        self.addCleanup(ProcessManager.clear_cancel)
+
+    def serve(self, program: bytes, seconds: float = 0.0) -> str:
+        """yt-dlp_linux and its SHA2-256SUMS on a local server; the program takes *seconds* to arrive."""
+        listing = f"{hashlib.sha256(program).hexdigest()}  yt-dlp_linux\n".encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = {"/rel/yt-dlp_linux": program, "/rel/SHA2-256SUMS": listing}.get(self.path)
+                if body is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                step = max(1, len(body) // 50)
+                try:
+                    for i in range(0, len(body), step):
+                        self.wfile.write(body[i:i + step])
+                        self.wfile.flush()
+                        time.sleep(seconds / 50 if body is program else 0)
+                except OSError:
+                    pass                                    # the client went away
+
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}/rel/yt-dlp_linux"
+
+    def installed(self):
+        """What the attempt left of yt-dlp in the project folder (program, launcher script, temp file)."""
+        return sorted(n for n in os.listdir(self.base) if n.startswith("yt-dlp"))
+
+    def test_stop_ends_the_first_batch_at_once(self):
+        Config.YT_DLP_URL = self.serve(self.PROGRAM, seconds=10)
+        urls = ["https://x.com/a/status/1", "https://x.com/b/status/2"]
+        pending, done = [], threading.Event()
+        thread = DownloadThread(urls, lambda p: (pending.extend(p), done.set()))
+        self.addCleanup(thread.join, 15)
+        with self.assertLogs("XDownloader", "DEBUG") as logs:
+            thread.start()
+            time.sleep(1)
+            stopped = time.time()
+            ProcessManager.cancel()                                 # the Stop button
+            self.assertTrue(done.wait(5), "Stop was not honoured")
+        self.assertLess(time.time() - stopped, 3)
+        self.assertEqual(pending, urls)                             # the URLs stay in the list
+        self.assertEqual(self.installed(), [])                      # nothing installed, nothing half written
+        self.assertEqual([r.getMessage() for r in logs.records if r.levelno >= logging.ERROR], [])
+
+    def test_stop_while_the_new_program_is_tried_installs_nothing(self):
+        trying = os.path.join(self.base, "being tried")
+        program = (f'#!/bin/sh\n[ "$1" = --version ] && echo > "{trying}" && exec sleep 30\n'.encode()
+                   + b"#" * 4096 + b"\n")
+        Config.YT_DLP_URL = self.serve(program)
+        outcome = {}
+
+        def work():
+            try:
+                outcome["r"] = EnvManager(self.log)._download_yt_dlp()
+            except ShutdownRequested as e:
+                outcome["r"] = type(e).__name__
+        thread = threading.Thread(target=work)
+        thread.start()
+        deadline = time.time() + 15
+        while not os.path.exists(trying) and time.time() < deadline:
+            time.sleep(0.02)
+        ProcessManager.cancel()
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "CancelRequested"})         # a stop, not a failed download
+        self.assertEqual(self.installed(), [])
 
 
 if __name__ == "__main__":

@@ -262,7 +262,7 @@ class TestStressSites(Base):
                 s = random.choice(spoofs) + f"?i={i}"
                 self.assertIsNone(find_site(s), f"False positive on spoof: {s}")
             else:
-                v = random.choice(valid) + f"_{i}"
+                v = random.choice(valid) + str(i)          # still a status id or a short code ("_" would end it)
                 self.assertIsNotNone(find_site(v), f"Failed to match valid site: {v}")
 
 
@@ -439,17 +439,16 @@ class TestStressCookies(Base):
         make_firefox_profile(self.base, "ff_prof", dirty_cookies)
 
         mgr = BrowserCookieManager(self.log, sites.X)
-        mgr._detected_browser = "firefox"
-        mgr._detected_profile = prof
+        exported = os.path.join(self.base, "exported.txt")
 
         for i in range(ITERATIONS):
-            ok = mgr.export_firefox_cookies()
+            ok = mgr._export_firefox_cookies(Path(prof) / "cookies.sqlite", exported)
             self.assertTrue(ok)
-            self.assertTrue(os.path.isfile(mgr.cookies_file))
+            self.assertTrue(os.path.isfile(exported))
             # Verify file mode 0600
-            self.assertEqual(os.stat(mgr.cookies_file).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(exported).st_mode & 0o777, 0o600)
             # Verify no line contains unescaped tabs inside value
-            with open(mgr.cookies_file, "r", encoding="utf-8") as f:
+            with open(exported, "r", encoding="utf-8") as f:
                 lines = [l for l in f.read().splitlines() if l and not l.startswith("#")]
                 for line in lines:
                     cols = line.split("\t")
@@ -600,12 +599,12 @@ class TestStressCore(Base):
             mode = i % 3
             if mode == 0:
                 # Success
-                ok = core.run(f"https://x.com/u/status/ok_{i}")
+                ok = core.run(f"https://x.com/ok/status/{i}")
                 self.assertTrue(ok)
             elif mode == 1:
                 # Non-retryable error (e.g. tweet unavailable / gone) -> should NOT retry
                 before_calls = len(self.calls())
-                ok = core.run(f"https://x.com/u/status/gone_{i}")
+                ok = core.run(f"https://x.com/gone/status/{i}")
                 self.assertFalse(ok)
                 after_calls = len(self.calls())
                 # Should have failed immediately on 1st attempt
@@ -613,7 +612,7 @@ class TestStressCore(Base):
             elif mode == 2:
                 # Flaky error -> retries up to MAX_RETRIES (2 times)
                 before_calls = len(self.calls())
-                ok = core.run(f"https://x.com/u/status/flaky_{i}")
+                ok = core.run(f"https://x.com/flaky/status/{i}")
                 self.assertFalse(ok)
                 after_calls = len(self.calls())
                 self.assertEqual(after_calls - before_calls, 2)
@@ -630,8 +629,8 @@ class TestStressCore(Base):
 
         for i in range(ITERATIONS):
             finish_events.clear()
-            urls = [f"https://x.com/user/status/ok_{i}_{j}" for j in range(2)]
-            external = f"https://x.com/user/status/external_{i}"
+            urls = [f"https://x.com/ok/status/{i * 10 + j}" for j in range(2)]
+            external = f"https://x.com/external/status/{i}"
             # Write to list.txt
             atomic_write_lines(Config.LIST_FILE, urls)
 

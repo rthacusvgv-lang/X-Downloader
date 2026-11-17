@@ -20,7 +20,7 @@ esac
 
 if [ "${IN_BUILD_CONTAINER:-}" != yes ]; then
     project=$(cd "$(dirname "$0")/.." && pwd)
-    engine=$(command -v podman || command -v docker)
+    engine=$(command -v podman || command -v docker) || { echo "tools/build-runtime.sh needs podman or docker" >&2; exit 1; }
     # Pinned by digest (the multi-platform index of debian:13 on 2026-11-04), so every rebuild starts from the same
     # image; the packages themselves come from the Debian archive and are listed in PACKAGES.txt. To move on, take the
     # current digest of the tag ("podman image inspect --format '{{.Digest}}' debian:13" after a pull).
@@ -142,7 +142,8 @@ cat > "$out/bin/python" <<EOF
 # Starts the bundled Python through the bundled dynamic loader, so the host's C library is never involved.
 # LD_LIBRARY_PATH stays unset on purpose: yt-dlp, ffmpeg, zenity and xdg-open are host programs.
 # -E -s: the host's PYTHON* variables and ~/.local packages are not meant for this interpreter.
-rt=\$(cd "\$(dirname "\$0")/.." && pwd -P)
+# CDPATH= : with "." in a CDPATH, cd would print where it went, into rt.
+rt=\$(CDPATH= cd "\$(dirname "\$0")/.." && pwd -P)
 export TCL_LIBRARY="\$rt/lib/tcl8.6" TK_LIBRARY="\$rt/lib/tk8.6"
 export SSL_CERT_FILE="\${SSL_CERT_FILE:-\$rt/etc/cacert.pem}"
 [ -e /etc/fonts/fonts.conf ] || export FONTCONFIG_FILE="\$rt/etc/fonts.conf"

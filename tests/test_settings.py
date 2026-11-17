@@ -466,7 +466,7 @@ class TestSettingsGuiComprehensive(unittest.TestCase):
             self.assertEqual(len(after_calls), int(retry_str), f"Expected {retry_str} attempts, got {len(after_calls)}")
 
         # Test each container format (mp4, mkv) + uncommitted pending dir in Settings committed on Download start
-        for fmt in Config.SUPPORTED_FORMATS:
+        for n, fmt in enumerate(Config.SUPPORTED_FORMATS):
             dlg._show_tab("Advanced")
             pump(app, timeout=0.05)
             dlg._on_format_change(fmt)
@@ -479,7 +479,7 @@ class TestSettingsGuiComprehensive(unittest.TestCase):
             # Do NOT press Enter in Settings; click Start Download directly on main window
             before_calls = len(read_calls(self.base))
             app._on_clear_list()
-            app._listbox.insert("end", f"https://x.com/ok/status/99{fmt}\n")
+            app._listbox.insert("end", f"https://x.com/ok/status/99{n}\n")       # a post id is digits only
             app._refresh_count()
             app._on_start_download()
             self.assertTrue(pump(app, lambda: not app._is_downloading, 15))
@@ -615,6 +615,76 @@ class TestStaleSettingsTempFiles(Base):
     def test_a_missing_folder_is_not_an_error(self):
         Config.SETTINGS_FILE = os.path.join(self.base, "no-such-folder", "settings.json")
         Config.load_settings()
+
+
+@unittest.skipUnless(HAS_DISPLAY, "needs a display")
+class TestMaxAttemptsSavedByHand(Base):
+    """settings.json takes any Max Attempts from 1 to 10, the menu offered 1, 2, 3 and 5: a value set by hand (4) was
+    shown, but was not in the list, and once another one was chosen it could not be chosen again."""
+
+    def test_the_saved_value_is_one_of_the_choices(self):
+        with open(Config.SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"max_retries": 4}, f)
+        self.install_fake_tools()
+        with mock.patch("xdownloader.env.EnvManager.update_yt_dlp"):
+            app = gui.App()
+        self.addCleanup(lambda: app._on_closing(confirm=False))
+        app._on_settings()
+        dialog = app._settings_window
+        dialog._show_tab("Advanced")
+        self.assertEqual(dialog._retry_opt.get(), "4")
+        self.assertEqual(list(dialog._retry_opt.cget("values")), ["1", "2", "3", "4", "5"])
+
+
+class TestTheProjectFolderIsNotSavedAsAPath(Base):
+    """Saving any setting (the language, say) wrote the default download folder, the project folder, as an absolute
+    path. A copy of the project then downloaded into the original's folder without a word, and a renamed or moved one
+    warned "drive not connected?" at every start and kept that dead path in settings.json (both measured)."""
+
+    def saved_dir(self, base=None):
+        with open(os.path.join(base or self.base, "settings.json"), encoding="utf-8") as f:
+            return json.load(f)["download_dir"]
+
+    def move_to(self, new_base, keep_old=True):
+        """The project folder copied (or moved) to *new_base*, then started there."""
+        (shutil.copytree if keep_old else shutil.move)(self.base, new_base)
+        point_config_to(new_base)
+        Config.load_settings()
+
+    def test_the_project_folder_is_saved_as_the_default(self):
+        Config.LANGUAGE = "zh_TW"
+        self.assertTrue(Config.save_settings())
+        self.assertEqual(self.saved_dir(), "")
+
+    def test_a_copy_of_the_project_downloads_into_its_own_folder(self):
+        Config.save_settings()
+        copy = self.base + "-copy"
+        self.move_to(copy)
+        self.assertEqual(Config.DOWNLOAD_DIR, copy)
+
+    def test_a_renamed_project_finds_its_folder(self):
+        Config.save_settings()
+        renamed = self.base + "-renamed"
+        self.move_to(renamed, keep_old=False)
+        self.assertEqual(Config.DOWNLOAD_DIR, renamed)
+        self.assertIsNone(Config.MISSING_DOWNLOAD_DIR)                  # no "drive not connected?" warning
+
+    def test_a_settings_file_that_stored_the_project_folder_is_brought_up_to_date(self):
+        with open(Config.SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"download_dir": self.base}, f)                   # what earlier versions wrote
+        Config.load_settings()
+        Config.save_settings()
+        self.assertEqual(self.saved_dir(), "")
+
+    def test_another_folder_is_still_saved_as_it_is(self):
+        videos = os.path.join(self.base, "videos")
+        os.mkdir(videos)
+        Config.DOWNLOAD_DIR = videos
+        Config.save_settings()
+        self.assertEqual(self.saved_dir(), videos)
+        point_config_to(self.base)
+        Config.load_settings()
+        self.assertEqual(Config.DOWNLOAD_DIR, videos)
 
 
 if __name__ == "__main__":

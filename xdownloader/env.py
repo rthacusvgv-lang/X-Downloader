@@ -14,10 +14,10 @@ from .config import Config
 from .fsutil import atomic_write_text
 from .system import ProcessManager, ShutdownRequested
 
-# Where EnvManager._fit_to_host() moves a program it replaces by a script: "yt-dlp" becomes "yt-dlp.bin".
+# Where EnvManager._install() puts a program it replaces by a script: "yt-dlp" becomes "yt-dlp.bin".
 BIN_SUFFIX = ".bin"
 
-# Takes the place of a program this system cannot start by itself, see EnvManager._fit_to_host().
+# Takes the place of a program this system cannot start by itself, see EnvManager._install().
 # LD_LIBRARY_PATH: yt-dlp restarts itself, and the second start needs to find the libraries too. It also hands the
 # variable on to whatever it starts, where our libc would break the system's programs; $ORIGIN is the folder of each
 # program, so this path only leads to the libraries from the project folder.
@@ -40,7 +40,7 @@ class EnvManager:
         return yt_dlp_ok and ffmpeg_ok
 
     def _ensure(self, path: str, name: str, downloader) -> bool:
-        # Prevent 0-byte or corrupt files from passing the check. After _fit_to_host() the program is path.bin and
+        # Prevent 0-byte or corrupt files from passing the check. After _install() the program may be path.bin, and
         # path is the script that starts it: a .bin without that script is not an installation.
         program = path + BIN_SUFFIX if os.path.isfile(path + BIN_SUFFIX) else path
         if os.path.isfile(path) and os.path.isfile(program) and os.path.getsize(program) > 1024:
@@ -59,15 +59,18 @@ class EnvManager:
     def _fetch(url: str, dest: str, checksums: str | None = None):
         """Downloads *url* to *dest* with a socket timeout (urlretrieve may hang forever).
 
-        Raises OSError if the connection dropped early: read(amt) just returns b'' on a
+        Raises OSError if the connection dropped early: reading just returns b'' on a
         truncated body, so a half-downloaded file would otherwise look like a success.
         Also if *checksums*, the SHA-256 list published in the same folder as *url*, gives another digest for it.
+        Raises ShutdownRequested / CancelRequested as soon as the program closes or Stop is pressed.
         """
         digest = hashlib.sha256()
         req = urllib.request.Request(url, headers={"User-Agent": "X-Downloader"})
         with urllib.request.urlopen(req, timeout=Config.HTTP_TIMEOUT) as resp, \
                 open(dest, 'wb') as out:
-            while chunk := resp.read(1024 * 1024):
+            # read1(): whatever has arrived, instead of waiting for a full MiB, so that Stop is noticed at once.
+            while chunk := resp.read1(1024 * 1024):
+                ProcessManager.raise_if_stopped()
                 digest.update(chunk)
                 out.write(chunk)
             expected = resp.headers.get("Content-Length")
@@ -97,25 +100,32 @@ class EnvManager:
                 return fields[0].lower()
         raise OSError(f"{name} is not listed in {folder}/{checksums}")
 
-    def _fit_to_host(self, path: str, version_flag: str):
-        """Lets a freshly downloaded program run where generic Linux builds cannot start by themselves: Alpine has
-        another C library, NixOS keeps glibc elsewhere. The dynamic loader of the bundled runtime can start them,
-        so a small script takes the place of the program, which moves to path.bin.
-        """
+    @staticmethod
+    def _runs_here(program: str, version_flag: str) -> bool:
+        """False if this system cannot start *program* by itself (generic Linux builds on Alpine or NixOS)."""
         try:
-            result = ProcessManager.run([path, version_flag], timeout=Config.TOOL_CHECK_TIMEOUT,
+            result = ProcessManager.run([program, version_flag], timeout=Config.TOOL_CHECK_TIMEOUT,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode != 127:        # 127: the stub NixOS keeps at the usual place of the loader
-                return
+            return result.returncode != 127     # 127: the stub NixOS keeps at the usual place of the loader
         except FileNotFoundError:               # the file is there: what is missing is its dynamic loader
-            pass
+            return False
         except (OSError, subprocess.TimeoutExpired):
-            return
+            return True
+
+    def _install(self, tmp: str, path: str, version_flag: str):
+        """Puts the downloaded program *tmp* in place as *path*.
+
+        Where generic Linux builds cannot start by themselves (Alpine has another C library, NixOS keeps glibc
+        elsewhere), the dynamic loader of the bundled runtime can start them: a small script takes the place of the
+        program, which goes to path.bin. *tmp* is tried before anything is put in place, so a Stop during the try
+        (it raises CancelRequested) leaves nothing half installed.
+        """
         loaders = glob.glob(os.path.join(sys.prefix, "lib", "ld-linux-*"))
-        if not loaders:
+        if self._runs_here(tmp, version_flag) or not loaders:
+            os.replace(tmp, path)
             return
         folder, name = os.path.split(path)
-        os.replace(path, path + BIN_SUFFIX)
+        os.replace(tmp, path + BIN_SUFFIX)
         atomic_write_text(path, _LOADER_SCRIPT.format(
             lib=os.path.relpath(os.path.dirname(loaders[0]), folder),
             loader=os.path.basename(loaders[0]),
@@ -130,18 +140,20 @@ class EnvManager:
             if os.path.getsize(tmp_path) <= 1024:
                 raise OSError("downloaded file is too small")
             os.chmod(tmp_path, 0o755)
-            os.replace(tmp_path, Config.YT_DLP_EXE)
-            self._fit_to_host(Config.YT_DLP_EXE, "--version")
+            self._install(tmp_path, Config.YT_DLP_EXE, "--version")
             self._logger.info("✅ yt-dlp download complete")
             return True
+        except ShutdownRequested:
+            raise                               # Stop or closing: not a failure, and nothing was installed
         except Exception as e:
             self._logger.error("❌ yt-dlp download failed: %s", e, exc_info=True)
             self._logger.error("  Please download manually: %s", Config.YT_DLP_URL)
+            return False
+        finally:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-            return False
 
     def _use_system_ffmpeg(self) -> bool:
         """Falls back to an ffmpeg installed on the system."""
@@ -181,11 +193,12 @@ class EnvManager:
             if os.path.getsize(tmp_exe) <= 1024:
                 raise OSError("extracted ffmpeg binary is too small")
             os.chmod(tmp_exe, 0o755)
-            os.replace(tmp_exe, Config.FFMPEG_EXE)
-            self._fit_to_host(Config.FFMPEG_EXE, "-version")
+            self._install(tmp_exe, Config.FFMPEG_EXE, "-version")
 
             self._logger.info("✅ ffmpeg extraction complete")
             return True
+        except ShutdownRequested:
+            raise                               # Stop or closing: no failure, no system ffmpeg instead
         except Exception as e:
             self._logger.error("❌ ffmpeg download or extraction failed: %s", e, exc_info=True)
             if self._use_system_ffmpeg():           # e.g. offline
@@ -206,6 +219,7 @@ class EnvManager:
             return
         try:
             # --ignore-config: without -P yt-dlp reads a yt-dlp.conf from the current folder (see DownloaderCore).
+            # One try: the program installs nightly builds, and a plain -U of those stays on nightly anyway.
             result = ProcessManager.run(
                 [Config.YT_DLP_EXE, "--ignore-config", "-U", "--update-to", "nightly"],
                 timeout=Config.UPDATE_TIMEOUT,
@@ -214,14 +228,7 @@ class EnvManager:
             if result.returncode == 0:
                 self._logger.info("✅ yt-dlp update check complete")
             else:
-                ProcessManager.run(
-                    [Config.YT_DLP_EXE, "--ignore-config", "-U"], check=True,
-                    timeout=Config.UPDATE_TIMEOUT,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-                )
-                self._logger.info("✅ yt-dlp update check complete (stable)")
-        except subprocess.CalledProcessError as e:
-            self._logger.warning("yt-dlp update failed, continuing execution.\n%s", e.stderr or e.stdout)
+                self._logger.warning("yt-dlp update failed, continuing execution.\n%s", result.stderr or result.stdout)
         except subprocess.TimeoutExpired:
             self._logger.warning("yt-dlp update timed out, continuing execution.")
         except ShutdownRequested:

@@ -609,6 +609,49 @@ class TestStopButton(Base):
             app.update()
 
 
+@unittest.skipUnless(HAS_DISPLAY, "no display available")
+class TestLinesThatAreNotUrlsStayInTheList(Base):
+    """A note in the queue box ("# for later"), a link of another site or an X page that is not a post vanished without a
+    word: after a batch the box held only the URLs still to do, and closing saved only the valid URLs to list.txt."""
+
+    def setUp(self):
+        super().setUp()
+        self.install_fake_tools()
+        from xdownloader import gui
+        with mock.patch("xdownloader.env.EnvManager.update_yt_dlp"):
+            self.app = gui.App()
+        self.addCleanup(self.close)
+        self.pump(lambda: not self.app._updating)
+
+    def close(self):
+        try:
+            self.app._on_closing(confirm=False)
+        except Exception:
+            pass
+
+    def pump(self, cond, timeout=15):
+        end = time.time() + timeout
+        while not cond() and time.time() < end:
+            self.app.update()
+            time.sleep(0.02)
+        return cond()
+
+    def lines(self):
+        return [line for line in self.app._listbox.get("1.0", "end-1c").splitlines() if line.strip()]
+
+    def test_a_batch_leaves_them_in_the_list(self):
+        self.app._listbox.insert("end", "# for later\nhttps://x.com/ok/status/1\nhttps://example.com/v/1\n")
+        self.app._on_start_download()
+        self.assertTrue(self.pump(lambda: not self.app._is_downloading))
+        self.assertEqual(len(self.calls()), 1)                         # only the post was downloaded
+        self.assertEqual(self.lines(), ["# for later", "https://example.com/v/1"])
+
+    def test_closing_saves_the_list_as_it_is_shown(self):
+        self.app._listbox.insert("end", "# for later\nhttps://x.com/a/status/1 the one with the cat\n")
+        self.app._on_closing(confirm=False)
+        self.assertEqual(read_lines(Config.LIST_FILE), ["# for later", "https://x.com/a/status/1 the one with the cat"])
+
+
 class TestWindowDuringTheStartupUpdate(Base):
     """The window stays usable while yt-dlp is checked for updates at startup, and switching the language then refreshes
     the Download button."""

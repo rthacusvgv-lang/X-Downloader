@@ -623,15 +623,18 @@ class SettingsDialog(_Dialog):
         CustomMessageBox(self, t("dlg_notice"), t(message_key)).show()
         return True
 
-    def _commit_pending_dir(self):
+    def _commit_pending_dir(self) -> bool:
+        """Applies a folder that was typed but not confirmed yet. False if it was refused (the user has been told why):
+        whatever was about to use the download folder must not go on with the old one."""
         if hasattr(self, "_dir_entry") and self._dir_entry.winfo_exists():
             if self._downloading():
                 self._restore_dir_entry()
-                return
+                return True
             raw = self._dir_entry.get()
             target = Config.resolve_path(raw)
             if target != Config.DOWNLOAD_DIR:
-                self._apply_dir(raw)
+                return self._apply_dir(raw)
+        return True
 
     def _build_sidebar(self):
         sidebar = ctk.CTkFrame(self, width=140, corner_radius=0, fg_color="#0D0E10", border_width=0)
@@ -769,8 +772,9 @@ class SettingsDialog(_Dialog):
 
         card1 = self._add_section_card("section_network")
         row1 = self._add_card_row(card1, t("label_max_retries"), t("desc_max_retries"))
+        # settings.json takes 1 to 10: a value set there by hand is one of the choices too, not just shown.
         self._retry_opt = option_menu(
-            row1, ["1", "2", "3", "5"], str(Config.MAX_RETRIES),
+            row1, [str(n) for n in sorted({1, 2, 3, 5, Config.MAX_RETRIES})], str(Config.MAX_RETRIES),
             self._on_retry_change, width=80
         )
         self._retry_opt.grid(row=0, column=1, sticky="e")
@@ -803,16 +807,18 @@ class SettingsDialog(_Dialog):
             if i < len(rows) - 1:
                 ctk.CTkFrame(card, fg_color=Theme.BORDER, height=1).pack(fill="x", padx=16)
 
-    def _apply_dir(self, raw_path: str, exact: bool = False):
-        """Makes *raw_path* the download folder. Typed text is expanded and trimmed like in a shell; a folder that was
-        chosen (*exact*: Browse, Default) is a real path and is taken as it is, so a name that yt-dlp would change is
-        refused below instead of being quietly replaced by its trimmed look-alike."""
+    def _apply_dir(self, raw_path: str, exact: bool = False) -> bool:
+        """Makes *raw_path* the download folder; False if it was refused (with a message) or is being applied already.
+
+        Typed text is expanded and trimmed like in a shell; a folder that was chosen (*exact*: Browse, Default) is a
+        real path and is taken as it is, so a name that yt-dlp would change is refused below instead of being quietly
+        replaced by its trimmed look-alike."""
         if getattr(self, "_applying_dir", False):
-            return
+            return False
         self._applying_dir = True
         try:
             if self._refuse_while_downloading("msg_dir_change_busy", self._restore_dir_entry):
-                return
+                return False
             path = os.path.abspath(raw_path) if exact else Config.resolve_path(raw_path)
             if not os.path.isdir(path):
                 try:
@@ -820,7 +826,7 @@ class SettingsDialog(_Dialog):
                 except (OSError, ValueError) as e:
                     self._restore_dir_entry()
                     CustomMessageBox(self, t("dlg_error"), t("msg_dir_create_failed", error=e), mode="error").show()
-                    return
+                    return False
             problem = folder_problem(path)
             if problem:
                 # Anything accepted here is shown as "✓ Auto-saved" and would only fail later, URL by URL.
@@ -831,7 +837,7 @@ class SettingsDialog(_Dialog):
                 else:
                     message = t("msg_dir_not_writable", error=problem[1])
                 CustomMessageBox(self, t("dlg_error"), message, mode="error").show()
-                return
+                return False
             Config.DOWNLOAD_DIR = path
             Config.MISSING_DOWNLOAD_DIR = None        # an explicit choice replaces a folder that was missing
             saved = self._save_settings()
@@ -841,6 +847,7 @@ class SettingsDialog(_Dialog):
                                            else t("status_save_failed"))
             if self._logger:
                 self._logger.info("Download folder set to: %s", Config.DOWNLOAD_DIR)
+            return True
         finally:
             self._applying_dir = False
 
@@ -867,7 +874,8 @@ class SettingsDialog(_Dialog):
         self._apply_dir(Config.BASE_PATH, exact=True)
 
     def _on_open_folder(self):
-        self._commit_pending_dir()
+        if not self._commit_pending_dir():
+            return                      # the folder typed was refused: do not show the old one as if it were it
         folder = Config.DOWNLOAD_DIR
         if not os.path.exists(folder):
             try:
@@ -977,6 +985,7 @@ class App(ctk.CTk):
         self._settings_window = None     # child windows / popup menu while open
         self._log_window = None
         self._custom_menu = None
+        self._other_lines: list[str] = []    # lines of the queue box without a supported URL, kept through a batch
         # Callables queued by worker threads, executed in the Tk main loop.
         self._ui_calls: queue.SimpleQueue = queue.SimpleQueue()
 
@@ -1003,6 +1012,7 @@ class App(ctk.CTk):
         orphans = ProcessManager.kill_orphans(Config.YT_DLP_EXE, Config.YT_DLP_EXE + BIN_SUFFIX)
         if orphans:
             self._logger.warning("Stopped %d leftover yt-dlp process group(s) from an earlier run.", orphans)
+        ProcessManager.remove_leftover_tmpdirs()         # what the children of that run left in the temporary folder
 
         # What a write killed before its rename left behind (Config.load_settings() does the same for settings.json).
         for path in (Config.LIST_FILE, Config.PROCESSING_FILE, Config.FAILED_FILE,
@@ -1142,7 +1152,8 @@ class App(ctk.CTk):
 
     def _save_list(self):
         try:
-            atomic_write_lines(Config.LIST_FILE, self._get_valid_urls())
+            # As shown: a note, or a link that is not a supported URL, must not vanish when the window closes.
+            atomic_write_lines(Config.LIST_FILE, merge_unique(self._box_lines()))
         except OSError as e:
             self._logger.error("Cannot save list.txt: %s", e)
 
@@ -1315,6 +1326,10 @@ class App(ctk.CTk):
     def _get_valid_urls(self):
         return extract_urls(self._listbox.get("1.0", "end-1c"))
 
+    def _box_lines(self) -> list[str]:
+        """The non-empty lines of the queue box, trimmed."""
+        return [line.strip() for line in self._listbox.get("1.0", "end-1c").splitlines() if line.strip()]
+
     def _on_context_paste(self):
         self._close_custom_menu()
         if self._is_downloading or self._listbox.cget("state") == "disabled":
@@ -1463,8 +1478,8 @@ class App(ctk.CTk):
             return
         if self._updating:
             return
-        if _alive(self._settings_window):
-            self._settings_window._commit_pending_dir()
+        if _alive(self._settings_window) and not self._settings_window._commit_pending_dir():
+            return              # the folder typed in Settings was refused, with a message: nothing starts in the old one
         urls = self._get_valid_urls()
         if not urls:
             sites = ", ".join(s.name for s in SITES)
@@ -1472,6 +1487,8 @@ class App(ctk.CTk):
             return
 
         self._close_custom_menu()
+        # Not downloaded, but the user's: they come back into the list when the batch ends (see _reset_controls).
+        self._other_lines = [line for line in self._box_lines() if not extract_urls(line)]
         self._is_downloading = True
         self._set_ui_state(downloading=True)
         self._progress.start()
@@ -1493,9 +1510,11 @@ class App(ctk.CTk):
         # Re-enable first: a disabled CTkTextbox silently ignores insert/delete.
         self._set_ui_state(downloading=False)
         self._listbox.delete("1.0", "end")
-        # Unfinished URLs (e.g. dependency download failed) are restored instead of lost.
-        if pending:
-            self._listbox.insert("end", "\n".join(pending) + "\n")
+        # Unfinished URLs (e.g. dependency download failed) are restored instead of lost, and so are the lines that
+        # were not URLs to download.
+        lines = merge_unique(pending or [], self._other_lines)
+        if lines:
+            self._listbox.insert("end", "\n".join(lines) + "\n")
         self._refresh_count()
 
 

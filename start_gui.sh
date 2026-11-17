@@ -6,6 +6,9 @@
 # and the program fetches yt-dlp and ffmpeg itself. No root password, no package manager.
 # Plain sh on purpose: not every system has bash.
 # ═══════════════════════════════════════════════════════════════
+# A CDPATH makes cd look elsewhere first, and with "." in it (a common setting) cd prints where it went, which breaks
+# rt=$(cd ...) in the bundled bin/python. Unset here, it is gone for everything started below too.
+unset CDPATH
 cd "$(dirname "$0")" || exit 1
 
 # ── Color definitions ───────────────────────────────────────
@@ -38,12 +41,43 @@ if [ -f "$BUNDLE" ]; then
     esac
     # The stamp is written last, so an interrupted unpacking starts over instead of leaving half a
     # runtime behind; a bundle newer than the stamp means the project was updated.
-    if [ ! -f "$RUNTIME/.unpacked" ] || [ "$BUNDLE" -nt "$RUNTIME/.unpacked" ]; then
-        log_step "正在準備內附的執行環境（只有第一次需要）..."
-        rm -rf "$RUNTIME"
-        if ! { mkdir -p "$RUNTIME" && tar -xzf "$BUNDLE" -C "$RUNTIME" && touch "$RUNTIME/.unpacked"; }; then
-            log_err "無法解開 $BUNDLE：請確認專案資料夾可以寫入，檔案也完整。"
-            exit 1
+    unpacked() { [ -f "$RUNTIME/.unpacked" ] && ! [ "$BUNDLE" -nt "$RUNTIME/.unpacked" ]; }
+    if ! unpacked; then
+        # Two launches at once (a double click on the first start) must not unpack into the same folder together: one
+        # started the program on a half-written runtime. mkdir is atomic, so one takes the lock and the other waits,
+        # then finds the runtime ready. A lock whose launcher is gone (killed meanwhile) is taken over, as is one held
+        # for over 2 minutes.
+        LOCK="$RUNTIME.lock"
+        mkdir -p .runtime 2>/dev/null
+        mine=
+        waited=0
+        while :; do
+            if mkdir "$LOCK" 2>/dev/null; then mine=1; break; fi
+            [ -d "$LOCK" ] || break                 # no other launcher: the folder cannot be written (said below)
+            holder=
+            read -r holder 2>/dev/null < "$LOCK/pid"
+            if { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } || [ "$waited" -ge 120 ]; then
+                rm -rf "$LOCK"
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if [ -n "$mine" ]; then
+            echo $$ > "$LOCK/pid"
+            trap 'rm -rf "$LOCK"' EXIT
+            trap 'exit 1' HUP INT TERM
+        fi
+        if ! unpacked; then                         # the launcher that held the lock may have done it
+            log_step "正在準備內附的執行環境（只有第一次需要）..."
+            rm -rf "$RUNTIME"
+            if ! { mkdir -p "$RUNTIME" && tar -xzf "$BUNDLE" -C "$RUNTIME" && touch "$RUNTIME/.unpacked"; }; then
+                log_err "無法解開 $BUNDLE：請確認專案資料夾可以寫入，檔案也完整。"
+                exit 1
+            fi
+        fi
+        if [ -n "$mine" ]; then
+            rm -rf "$LOCK"
+            trap - EXIT HUP INT TERM
         fi
     fi
     PYTHON="$RUNTIME/bin/python"
@@ -73,8 +107,11 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     log_warn "未偵測到圖形顯示環境（DISPLAY / WAYLAND_DISPLAY），GUI 可能無法啟動。"
 fi
 
-# Write startup errors to gui_startup.log (previously sent to /dev/null, so failures were silent)
+# Write startup errors to gui_startup.log (previously sent to /dev/null, so failures were silent). Made anew each time,
+# not just emptied: emptying keeps the mode of the first one (0666 if that was under umask 0), and one left by a run
+# with sudo cannot be written at all, which stopped every launch.
 GUI_LOG="$(pwd)/gui_startup.log"
+rm -f "$GUI_LOG"
 nohup "$PYTHON" -m xdownloader >"$GUI_LOG" 2>&1 &
 GUI_PID=$!
 sleep 2

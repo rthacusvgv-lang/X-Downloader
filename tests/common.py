@@ -198,11 +198,15 @@ def make_firefox_profile(root, name, cookies):
 
 
 def make_chromium_cookies(path, cookies):
-    """Creates a Chromium-style Cookies database with (name, host_key) rows."""
+    """Creates a Chromium-style Cookies database with (name, host_key[, expires_utc]) rows.
+
+    expires_utc counts microseconds since 1601-01-01 UTC, as in Chromium; 0 (the default) is a session cookie.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     db = sqlite3.connect(path)
-    db.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB, path TEXT)")
-    for n, h in cookies:
-        db.execute("INSERT INTO cookies VALUES (?,?,x'00','/')", (h, n))
+    db.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB, path TEXT, "
+               "expires_utc INTEGER NOT NULL DEFAULT 0)")
+    for n, h, *expires in cookies:
+        db.execute("INSERT INTO cookies VALUES (?,?,x'00','/',?)", (h, n, expires[0] if expires else 0))
     db.commit()
     db.close()

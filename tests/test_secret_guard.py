@@ -40,6 +40,10 @@ class TestScanner(unittest.TestCase):
         "Cookie header in a script": ("t.sh", f"curl -H 'Cookie: auth_token={TOKEN}; ct0={TOKEN}' https://x.com"),
         "environment variable": ("e.txt", f"X_AUTH_TOKEN={TOKEN}"),
         "Python dict": ("t.py", f"COOKIES = {{'auth_token': '{TOKEN}'}}"),
+        # These three went through (measured):
+        "camelCase name (JavaScript)": ("c.js", f'const authToken = "{TOKEN}";'),
+        "kebab-case name (YAML)": ("c.yml", f"auth-token: {TOKEN}"),
+        "a table with wide padding": ("t.md", "auth_token" + " " * 12 + TOKEN),
         "twid cookie (the numeric X user id)": ("a.txt", "twid=u%3D" + "1234567890123456789"),
         "private key": ("k.txt", "-----BEGIN " + "OPENSSH PRIVATE KEY-----"),
     }
@@ -69,6 +73,18 @@ class TestScanner(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(name, result.stderr)
 
+    def test_a_name_that_git_puts_in_quotes_is_checked_too(self):
+        # git writes a file name that holds ", \ or a tab C-quoted ("b/my \"cookies\".txt"), and the name rules saw
+        # the quoted text, so they let every such file through (measured with the real hook).
+        def quoted(path):
+            return '"' + path.replace("\\", "\\\\").replace('"', '\\"').replace(TAB, "\\t") + '"'
+        for name in ('my "cookies".txt', "back\\slash-cookies.txt", f"tab{TAB}cookies.txt", 'odd"dir/settings.json'):
+            with self.subTest(name=name):
+                diff = (f"diff --git {quoted('a/' + name)} {quoted('b/' + name)}\nnew file mode 100644\n"
+                        f"--- /dev/null\n+++ {quoted('b/' + name)}\n@@ -0,0 +1 @@\n+harmless\n")
+                result = scan(diff)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_ordinary_code_is_left_alone(self):
         for label, (path, *lines) in self.ORDINARY.items():
             with self.subTest(label):
@@ -90,6 +106,7 @@ class TestScanner(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(path, result.stderr)
         self.assertEqual(scan(binary("bundled-runtime/linux-riscv64.tar.gz")).returncode, 0)
+        self.assertEqual(scan(binary("runtime/linux-x86_64.tar.gz")).returncode, 0)      # the folder's name until a925391
         self.assertEqual(scan(binary("docs/images/main-window.png")).returncode, 0)
         self.assertEqual(scan(binary("profile/Default/Cookies", deleted=True)).returncode, 0)    # removing one is the fix
 
@@ -107,6 +124,18 @@ class TestScanner(unittest.TestCase):
                                      "--no-ext-diff", "-U0", empty],
                                     capture_output=True, text=True, errors="replace", check=True).stdout
         result = scan(everything)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_whole_history_can_be_pushed_to_a_new_remote(self):
+        # On a first push (a new remote, a new repository) pre-push scans every commit. The runtime bundles were first
+        # committed as runtime/linux-*.tar.gz; after the folder became bundled-runtime/ only the new name was allowed
+        # as a binary file, so the project's own history was refused and only --no-verify could push it.
+        if git_ignores("README.md") is None:
+            self.skipTest("not a git checkout")
+        history = subprocess.run(["git", "-C", PROJECT, "-c", "core.quotepath=off", "log", "-p", "-m", "--no-color",
+                                  "--no-ext-diff", "--format=", "--diff-filter=ACMRT", "HEAD"],
+                                 capture_output=True, text=True, errors="replace", check=True).stdout
+        result = scan(history)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
@@ -150,6 +179,16 @@ class TestHooks(Base):
         self.write("helper.py", "x = 1\n" + cookie_export())
         self.git("add", "helper.py")
         self.assertNotEqual(self.git("commit", "-q", "-m", "oops").returncode, 0)
+
+    def test_pre_commit_checks_names_that_git_puts_in_quotes(self):
+        for name in ('my "cookies".txt', f"tab{TAB}cookies.txt", 'odd"dir/settings.json'):
+            with self.subTest(name=name):
+                path = os.path.join(self.repo, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                self.write(name, "harmless\n")                          # only the name gives it away
+                self.git("add", "-f", "--", name)
+                self.assertNotEqual(self.git("commit", "-q", "-m", "oops").returncode, 0)
+                self.git("reset", "-q")
 
     def test_pre_commit_accepts_an_ordinary_change(self):
         self.write("README.md", "hello\n")

@@ -234,5 +234,18 @@ class TestSystemsWithoutTheUsualGlibc(Base):
         self.assertFalse(os.path.exists(Config.YT_DLP_EXE + ".bin"))
 
 
+class TestBuildScript(unittest.TestCase):
+    def test_without_podman_or_docker_it_says_what_is_missing(self):
+        # It ended with exit code 1 and not a word (set -e and an empty `command -v`), measured.
+        tools = tempfile.mkdtemp(prefix="tools_", dir=SANDBOX)
+        for tool in ("bash", "dirname"):
+            os.symlink(shutil.which(tool), os.path.join(tools, tool))
+        result = subprocess.run(["bash", os.path.join(PROJECT, "tools", "build-runtime.sh"), "x86_64"],
+                                env={"PATH": tools}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("podman", result.stderr)
+        self.assertIn("docker", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

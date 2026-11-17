@@ -1,6 +1,8 @@
 """core.py: one URL with its retries (DownloaderCore) and a whole batch (DownloadThread)."""
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import textwrap
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 from common import (
@@ -104,28 +107,6 @@ class TestDownloaderCore(Base):
         args = self.calls()[-1].split()
         self.assertIn("-P", args)
         self.assertEqual(args[args.index("-P") + 1], custom_target)
-
-    def test_fallback_respects_non_retryable_and_max_retries(self):
-        self.cm._cookie_args = ["--cookies-from-browser", "firefox:/tmp/prof"]
-        with mock.patch.object(self.cm, "export_firefox_cookies", return_value=True) as m_export:
-            # 1. Non-retryable error (deleted tweet) must not trigger Firefox cookie export fallback
-            Config.MAX_RETRIES = 3
-            c = DownloaderCore(self.log, {sites.X.name: self.cm})
-            self.assertFalse(c.run("https://x.com/gone/status/99"))
-            self.assertFalse(m_export.called)
-            self.assertEqual(len(self.calls()), 1)
-
-            # 2. When MAX_RETRIES == 1, transient failure stops after 1 attempt without phantom fallback
-            Config.MAX_RETRIES = 1
-            self.assertFalse(c.run("https://x.com/flaky/status/99"))
-            self.assertFalse(m_export.called)
-            self.assertEqual(len(self.calls()), 2)
-
-            # 3. When MAX_RETRIES >= 2, transient failure on attempt 1 triggers Firefox cookie export fallback
-            Config.MAX_RETRIES = 2
-            self.assertFalse(c.run("https://x.com/flaky/status/99"))
-            self.assertTrue(m_export.called)
-            self.assertEqual(len(self.calls()), 4)
 
 
 class TestDownloadThread(Base):
@@ -267,6 +248,86 @@ class TestOutputTemplateLength(Base):
         legacy = "%(uploader)s_%(title).50s_%(id)s.%(ext)s"
         for uploader, text in (("1101sui", "x" * 120), ("N" * 50, "short"), ("Café Zoë", "Ça va très bien " * 5)):
             self.assertEqual(self.filename(uploader, text), self.filename(uploader, text, legacy))
+
+
+@unittest.skipUnless(os.path.exists(REAL_YTDLP), "real yt-dlp not present")
+class TestAFailedDownloadLogsWhatWentWrongNotItsProgress(Base):
+    """yt-dlp writes its progress as updates separated by \\r, and the log turned each update into a line: one failed
+    attempt of a 40 MiB download logged 329 lines, 311 of them progress (measured with the real yt-dlp). From about
+    85 MiB on, yt-dlp's error was pushed out of the log panel, which keeps the last 900 to 1000 lines."""
+    TOTAL, FAIL_AT = 4 << 20, 3 << 20        # the server answers 500 from the fourth MiB on
+
+    def serve(self) -> str:
+        total, fail_at = self.TOTAL, self.FAIL_AT
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+                start = int(m.group(1)) if m else 0
+                end = min(int(m.group(2)) if m and m.group(2) else total - 1, total - 1)
+                if start >= fail_at:
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(206 if m else 200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(end - start + 1))
+                if m:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                self.end_headers()
+                try:
+                    self.wfile.write(b"\0" * (end - start + 1))
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}/"
+
+    def test_one_failed_attempt_logs_the_error_and_no_progress(self):
+        self.install_fake_tools()
+        shutil.copy(REAL_YTDLP, Config.YT_DLP_EXE)
+        Config.MAX_RETRIES = 1
+        prefix = self.serve()
+        local = sites.Site(name="Loopback", url_prefixes=(prefix,), cookie_domains=("127.0.0.1",), login_cookie="sid",
+                           required_cookies=("sid",), probe_url=prefix)
+        mgr = BrowserCookieManager(self.log, local)
+        mgr._cookie_args = []
+        core = DownloaderCore(self.log, {local.name: mgr})
+        with mock.patch.object(sites, "SITES", [local]), self.assertLogs(self.log, "DEBUG") as logs:
+            self.assertFalse(core.run(prefix + "clip.mp4"))
+        ytdlp = [line for line in logs.output if "yt-dlp:" in line]
+        self.assertTrue(any("HTTP Error 500" in line for line in ytdlp), ytdlp[:5])
+        self.assertEqual([line for line in ytdlp if re.search(r"\d% of", line)], [])
+        self.assertLess(len(ytdlp), 40)
+
+
+class TestTheNotLoggedInHintIsForGuestsOnly(FakeToolsBase):
+    """X answers "No video could be found" for a post without a video too. The hint "you are not logged in" came with it
+    even when the download had the login cookies (the real log: 1000 cookies extracted from Firefox, then that hint),
+    which sent people after a login that was fine."""
+
+    def hints(self, cookie_args):
+        write_fake_ytdlp('echo "ERROR: [twitter] 1: No video could be found in this tweet" >&2; exit 1')
+        mgr = BrowserCookieManager(self.log, sites.X)
+        mgr._cookie_args = cookie_args
+        core = DownloaderCore(self.log, {sites.X.name: mgr})
+        with self.assertLogs(self.log, "INFO") as logs:
+            self.assertFalse(core.run("https://x.com/u/status/1"))
+        return [line for line in logs.output if "not logged into" in line]
+
+    def test_no_hint_when_the_login_cookies_were_sent(self):
+        self.assertEqual(self.hints(["--cookies", cookies_path()]), [])
+
+    def test_a_guest_still_gets_the_hint(self):
+        self.assertEqual(len(self.hints([])), 1)
 
 
 class TestErrorsThatRetryingCannotFix(FakeToolsBase):
@@ -505,14 +566,13 @@ class TestYtDlpIgnoresConfigFiles(FakeToolsBase):
     def test_every_yt_dlp_call_ignores_config_files(self):
         write_fake_ytdlp("""\
             echo "$@" >> "$(dirname "$0")/calls.log"
-            case " $* " in *" nightly "*) exit 1 ;; esac     # the nightly update fails: the stable one runs too
             exit 0
         """)
         self.assertTrue(self.core.run("https://x.com/u/status/1"))
         EnvManager(self.log).update_yt_dlp()
         BrowserCookieManager(self.log, sites.X)._test_browser_cookies("firefox")
         calls = self.calls()
-        self.assertEqual(len(calls), 4, calls)        # download, nightly update, stable update, cookie probe
+        self.assertEqual(len(calls), 3, calls)        # download, update, cookie probe
         self.assertEqual([c for c in calls if "--ignore-config" not in c.split()], [])
 
 
@@ -537,7 +597,7 @@ class TestUndecodableQueueFiles(BatchBase):
 class TestOneBadUrlDoesNotStopTheBatch(BatchBase):
     """An exception other than OSError / CalledProcessError (NUL byte -> ValueError) aborted the batch,
     and the offending URL was put back first, so every rerun stopped at the same place."""
-    POISON = "https://t.co/a\x00b"
+    POISON = "https://x.com/a\x00b/status/1"        # a NUL byte reaches subprocess, which raises ValueError
 
     def test_rest_of_the_batch_is_downloaded_and_the_url_is_recorded(self):
         pending = self.run_batch(["https://x.com/ok/status/1", self.POISON, "https://x.com/ok/status/2"])
@@ -675,8 +735,8 @@ class TestListChangesDuringABatch(Base):
     def test_core_dropped_url_in_ui_does_not_resurrect(self):
         """If user removed a URL in UI before download, it must NOT come back after download."""
         self.install_fake_tools()
-        stale_url = "https://x.com/user/status/stale_removed_in_ui"
-        kept_url = "https://x.com/user/status/kept_1?ok"
+        stale_url = "https://x.com/stale_removed_in_ui/status/1"
+        kept_url = "https://x.com/ok/status/2"
 
         # Initially list.txt has both
         atomic_write_lines(Config.LIST_FILE, [stale_url, kept_url])
@@ -692,21 +752,21 @@ class TestListChangesDuringABatch(Base):
         self.assertEqual(done, [[]])
 
     def test_core_external_additions_before_run_start_survive(self):
-        """Ensure external additions arriving within 1ms of thread.start() are preserved."""
+        """A URL appended to list.txt after the batch was set up (its list.txt lines are known) but before it starts
+        counts as new and is kept. (The append used to race the start of the batch, 50 times over: one that lands in the
+        milliseconds while list.txt is rewritten is lost, as the README says, and under load about half the runs
+        failed. That window cannot be closed without the appending program's cooperation.)"""
         self.install_fake_tools()
-        for i in range(50):
-            batch_url = f"https://x.com/user/status/batch_{i}?ok"
-            ext_url = f"https://x.com/user/status/ext_{i}"
-
-            atomic_write_lines(Config.LIST_FILE, [batch_url])
-            thread = DownloadThread([batch_url], on_finish=lambda p: None)
-            thread.start()
-            # Rapid append
-            with open(Config.LIST_FILE, "a") as f:
-                f.write(f"{ext_url}\n")
-            thread.join(timeout=10)
-
-            self.assertIn(ext_url, read_lines(Config.LIST_FILE))
+        batch_url = "https://x.com/ok/status/1"
+        ext_url = "https://x.com/ext/status/2"
+        atomic_write_lines(Config.LIST_FILE, [batch_url])
+        done = threading.Event()
+        thread = DownloadThread([batch_url], on_finish=lambda p: done.set())
+        with open(Config.LIST_FILE, "a") as f:
+            f.write(f"{ext_url}\n")
+        thread.start()
+        self.assertTrue(done.wait(10))
+        self.assertEqual(read_lines(Config.LIST_FILE), [ext_url])
 
 
 if __name__ == "__main__":

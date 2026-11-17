@@ -2,18 +2,22 @@
 import logging
 import logging.handlers
 import os
+import signal
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from unittest import mock
 
 from common import (
-    Base, Config, LockManager, PROJECT, ProcessManager, QueueManager, ShutdownRequested, atomic_write_lines,
-    process_alive, read_lines, setup_logger, write_fake_ytdlp,
+    Base, Config, LockManager, PROJECT, ProcessManager, QueueManager, REAL_YTDLP, ShutdownRequested,
+    atomic_write_lines, process_alive, read_lines, setup_logger, write_fake_ytdlp,
 )
+from xdownloader.system import host_env
 
 
 HAS_DISPLAY = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -214,8 +218,8 @@ class TestProcessManager(Base):
 
     def test_timeout_with_dead_leader_and_pipe_holding_grandchild(self):
         # The leader exits at once but its background child keeps stdout open: communicate()
-        # times out, and the group must still be killed (poll() reaping the leader used to make
-        # _kill_group return early, so the follow-up communicate() blocked until the child ended).
+        # times out, and the group must still be killed (poll() reaping the leader used to make the
+        # kill return early, so the follow-up communicate() blocked until the child ended).
         t0 = time.time()
         with self.assertRaises(subprocess.TimeoutExpired):
             ProcessManager.run(["sh", "-c", "sleep 30 & exit 0"], timeout=1,
@@ -440,7 +444,7 @@ class TestOrphanSweep(Base):
     def test_leftover_download_is_killed(self):
         orphan = self.spawn(start_new_session=True)                   # how ProcessManager starts its children
         self.assertEqual(ProcessManager.kill_orphans(Config.YT_DLP_EXE), 1)
-        self.assertEqual(orphan.wait(5), -9)
+        self.assertLess(orphan.wait(5), 0)                            # ended by a signal
 
     def test_a_download_started_through_the_dynamic_loader_is_found_too(self):
         # Alpine and NixOS: yt-dlp is a script, and its program yt-dlp.bin runs as `ld.so --library-path DIR program`
@@ -450,12 +454,136 @@ class TestOrphanSweep(Base):
         orphan = self.spawn(["bash", "-c", "sleep 30; true", "ld.so", "--library-path", self.base, program],
                             start_new_session=True)
         self.assertEqual(ProcessManager.kill_orphans(Config.YT_DLP_EXE, program), 1)
-        self.assertEqual(orphan.wait(5), -9)
+        self.assertLess(orphan.wait(5), 0)
 
     def test_other_processes_are_left_alone(self):
         manual = self.spawn(preexec_fn=os.setpgrp)                    # a job of the user's shell: not a session leader
         self.assertEqual(ProcessManager.kill_orphans(Config.YT_DLP_EXE), 0)
         self.assertTrue(process_alive(manual.pid))
+
+
+class TestStoppedChildrenGetToCleanUp(Base):
+    """The Stop button, closing the window, a timeout and the orphan sweep ended children with SIGKILL at once. yt-dlp
+    is a self-unpacking program: on SIGKILL its unpacked copy (about 85 MiB, measured) stays in the temp folder, one per
+    Stop or close; two were found in the real /tmp. On SIGTERM it removes the copy and ends within 0.03 s (measured)."""
+
+    def setUp(self):
+        super().setUp()
+        ProcessManager.clear_cancel()
+        self.addCleanup(ProcessManager.clear_cancel)
+        self.marker = os.path.join(self.base, "cleaned up")
+        self.ready = os.path.join(self.base, "ready")
+
+    def child(self, on_term: str) -> str:
+        """A shell script that runs *on_term* on SIGTERM, as a self-unpacking program cleans up, and otherwise waits."""
+        return f'trap \'{on_term}\' TERM; echo > "{self.ready}"; sleep 30 & wait'
+
+    def start(self, cmd, ready=None, **kw):
+        """Runs *cmd* through ProcessManager on a thread, as a download does; returns once ready() says so."""
+        outcome = {}
+
+        def work():
+            try:
+                ProcessManager.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+                outcome["r"] = "returned"
+            except ShutdownRequested as e:
+                outcome["r"] = type(e).__name__
+        thread = threading.Thread(target=work)
+        thread.start()
+        ready = ready or (lambda: os.path.exists(self.ready))
+        deadline = time.time() + 30
+        while not ready() and time.time() < deadline:
+            time.sleep(0.02)
+        return thread, outcome
+
+    def test_stop_lets_the_child_clean_up(self):
+        thread, outcome = self.start(["sh", "-c", self.child(f'echo > "{self.marker}"; exit 1')])
+        ProcessManager.cancel()
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "CancelRequested"})
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_closing_lets_the_child_clean_up(self):
+        thread, outcome = self.start(["sh", "-c", self.child(f'echo > "{self.marker}"; exit 1')])
+        ProcessManager.kill_all()
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "ShutdownRequested"})
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_a_timeout_lets_the_child_clean_up(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ProcessManager.run(["sh", "-c", self.child(f'echo > "{self.marker}"; exit 1')], timeout=1,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_the_orphan_sweep_lets_a_leftover_clean_up(self):
+        write_fake_ytdlp(self.child(f'echo > "{self.marker}"; exit 1'))
+        orphan = subprocess.Popen([Config.YT_DLP_EXE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        self.addCleanup(lambda: orphan.poll() is None and os.killpg(orphan.pid, signal.SIGKILL))
+        deadline = time.time() + 10
+        while not os.path.exists(self.ready) and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(ProcessManager.kill_orphans(Config.YT_DLP_EXE), 1)
+        orphan.wait(5)
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_a_child_that_ends_with_0_on_sigterm_is_still_stopped_not_a_success(self):
+        thread, outcome = self.start(["sh", "-c", self.child(f'echo > "{self.marker}"; exit 0')])
+        ProcessManager.cancel()
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "CancelRequested"})
+
+    def test_a_child_that_ignores_sigterm_is_killed_all_the_same(self):
+        thread, outcome = self.start(["sh", "-c", self.child("")])      # trap '' TERM: its sleep ignores it too
+        started = time.time()
+        ProcessManager.cancel()
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "CancelRequested"})
+        self.assertLess(time.time() - started, 10)
+
+    @unittest.skipUnless(os.path.exists(REAL_YTDLP), "real yt-dlp not present")
+    def test_a_yt_dlp_stopped_while_it_unpacks_itself_leaves_nothing_either(self):
+        # In its first ~0.4 s yt-dlp is still unpacking itself and dies of SIGTERM without removing the part it has
+        # unpacked (measured: 12 to 69 MiB). Every attempt starts with that window, so a Stop could hit it.
+        tmp = tempfile.mkdtemp(prefix="tmp_", dir=self.base)
+
+        def unpacking():
+            return any(name.startswith("_MEI") for _, dirs, _ in os.walk(tmp) for name in dirs)
+        thread, outcome = self.start([REAL_YTDLP, "--ignore-config", "--version"], ready=unpacking,
+                                     env=dict(host_env(), TMPDIR=tmp))
+        self.assertTrue(unpacking(), "yt-dlp never began to unpack itself")
+        ProcessManager.cancel()                     # at once: it is still unpacking
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "CancelRequested"})
+        self.assertEqual(os.listdir(tmp), [])
+
+    def test_leftovers_of_a_killed_earlier_run_are_removed_at_the_next_start(self):
+        tmp = tempfile.mkdtemp(prefix="tmp_", dir=self.base)
+        with mock.patch.object(tempfile, "tempdir", tmp):
+            ours = os.path.join(tmp, ProcessManager.tmpdir_prefix() + "k1ll3d00")
+            os.makedirs(os.path.join(ours, "_MEIabc123"))           # half unpacked, its program killed with us
+            other_project = os.path.join(tmp, "xdl-run-0000000000-r0nn1ng0")
+            os.makedirs(other_project)                              # another copy of the program, maybe running
+            ProcessManager.remove_leftover_tmpdirs()
+        self.assertEqual(sorted(os.listdir(tmp)), [os.path.basename(other_project)])
+
+    @unittest.skipUnless(os.path.exists(REAL_YTDLP), "real yt-dlp not present")
+    def test_a_stopped_yt_dlp_leaves_nothing_in_the_temp_folder(self):
+        tmp = tempfile.mkdtemp(prefix="tmp_", dir=self.base)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)                          # takes the connection and never answers: yt-dlp waits
+        self.addCleanup(listener.close)
+        url = f"http://127.0.0.1:{listener.getsockname()[1]}/clip.mp4"
+        thread, outcome = self.start([REAL_YTDLP, "--ignore-config", "--socket-timeout", "60", "--", url],
+                                     ready=lambda: bool(os.listdir(tmp)), env=dict(host_env(), TMPDIR=tmp))
+        self.assertTrue(os.listdir(tmp), "yt-dlp never unpacked itself")
+        time.sleep(1.5)                             # unpacked, started, connected
+        ProcessManager.cancel()
+        thread.join(15)
+        self.assertEqual(outcome, {"r": "CancelRequested"})
+        self.assertEqual(os.listdir(tmp), [])
 
 
 class TestLockManagerReentrancy(Base):

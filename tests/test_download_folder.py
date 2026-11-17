@@ -266,6 +266,35 @@ class TestSettingsPageRejectsUnusableFolders(Base):
         self.dialog._on_focus_out()
         self.assertEqual(Config.DOWNLOAD_DIR, target)
 
+    @NOT_ROOT
+    def test_a_refused_folder_does_not_let_the_download_start_in_the_old_one(self):
+        # The folder typed in Settings was refused with a message, and the batch then started anyway, into the folder
+        # the user had just tried to replace.
+        before = Config.DOWNLOAD_DIR
+        self.dialog._dir_entry.delete(0, "end")
+        self.dialog._dir_entry.insert(0, "/usr/bin")
+        self.app._listbox.insert("end", "https://x.com/ok/status/1\n")
+        calls_before = len(self.calls())
+        self.app._on_start_download()
+        started = self.app._is_downloading
+        end = time.time() + 15
+        while self.app._is_downloading and time.time() < end:        # a batch started by mistake runs to its end:
+            self.app.update()                                         # closing during one asks a question, and the
+            time.sleep(0.02)                                          # test would hang there instead of failing
+        self.assertFalse(started)
+        self.assertEqual(len(self.shown), 1)                          # the reason, once
+        self.assertEqual(Config.DOWNLOAD_DIR, before)
+        self.assertEqual(len(self.calls()), calls_before)             # yt-dlp never started
+
+    @NOT_ROOT
+    def test_a_refused_folder_is_not_replaced_by_the_old_one_in_the_file_manager(self):
+        self.dialog._dir_entry.delete(0, "end")
+        self.dialog._dir_entry.insert(0, "/usr/bin")
+        with mock.patch.object(self.gui.subprocess, "Popen") as popen:
+            self.dialog._on_open_folder()
+        self.assertEqual(len(self.shown), 1)
+        popen.assert_not_called()
+
     def test_spaces_around_a_typed_path_are_trimmed(self):
         # The usual copy & paste accident. (A path that arrives untrimmed, e.g. from a hand-edited
         # settings.json, is refused by folder_problem(): yt-dlp would strip it and write elsewhere.)
@@ -354,7 +383,7 @@ class TestTemporarilyMissingDownloadFolder(Base):
         self.write_settings("/dev/null")                      # exists, but is not a folder
         Config.load_settings()
         Config.save_settings()
-        self.assertEqual(self.saved_dir(), self.base)
+        self.assertEqual(self.saved_dir(), "")                # the project folder, the default
 
     @unittest.skipUnless(HAS_DISPLAY, "needs a display")
     def test_the_app_warns_and_an_explicit_choice_replaces_it(self):

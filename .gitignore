@@ -18,7 +18,7 @@
 !/start_gui.sh
 !/LICENSE*
 !/requirements.txt
-!/*.README.md
+!/README.md
 
 # Folders are allowed, but inside them only these kinds of file.
 !/bundled-runtime/

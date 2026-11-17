@@ -6,6 +6,7 @@ and the script runs under `sh` (dash on most systems, so bash-only syntax fails 
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -143,6 +144,86 @@ class TestLauncher(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn(ARCH, result.stdout)
         self.assertIn("Python 3.10", result.stdout)
+
+    def test_the_startup_log_is_made_anew_for_every_launch(self):
+        # It was only emptied: a log made once under umask 0 stayed writable for everyone (found 0666 in the user's
+        # project folder), and one that cannot be opened (left by a run with sudo) stopped every launch, with the old
+        # log shown as the reason.
+        self.make_bundle()
+        log = os.path.join(self.project, "gui_startup.log")
+        umask = os.umask(0o022)
+        self.addCleanup(os.umask, umask)
+        for n, mode in enumerate((0o666, 0o444), 1):
+            with self.subTest(mode=oct(mode)):
+                with open(log, "w") as f:
+                    f.write("the log of an earlier run\n")
+                os.chmod(log, mode)
+                result = self.launch()
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(len(self.started()), n)                # the program was started
+                self.assertEqual(stat.S_IMODE(os.stat(log).st_mode), 0o644)
+
+    def test_a_second_launch_waits_while_another_one_unpacks(self):
+        # A double click on the first start ran two launchers that unpacked into the same folder at once, and one of
+        # them started the program on a runtime that was still being written (measured: 4 rounds of 15).
+        self.make_bundle()
+        other = subprocess.Popen(["sleep", "60"])                       # the launcher that is unpacking right now
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        lock = self.unpacked + ".lock"
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w") as f:
+            f.write(f"{other.pid}\n")
+        launcher = subprocess.Popen(["sh", "start_gui.sh"], cwd=self.project, env={"PATH": self.tools, "DISPLAY": ":0"},
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: launcher.poll() is None and launcher.kill())
+        time.sleep(2)
+        self.assertEqual(self.started(), [])                            # it waits
+        os.makedirs(self.unpacked, exist_ok=True)                       # the other one finishes and lets go
+        subprocess.run(["tar", "-xzf", self.bundle, "-C", self.unpacked], check=True)
+        mine = os.path.join(self.unpacked, "from the other launcher")
+        open(mine, "w").close()
+        open(os.path.join(self.unpacked, ".unpacked"), "w").close()
+        shutil.rmtree(lock)
+        out, _ = launcher.communicate(timeout=30)
+        self.assertEqual(launcher.returncode, 0, out)
+        self.assertEqual(len(self.started()), 1)
+        self.assertTrue(os.path.exists(mine), "the runtime was unpacked a second time")
+
+    def test_a_lock_left_by_a_killed_launch_does_not_block(self):
+        self.make_bundle()
+        gone = subprocess.Popen(["true"])
+        gone.wait()                                                     # its pid belongs to nobody now
+        lock = self.unpacked + ".lock"
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w") as f:
+            f.write(f"{gone.pid}\n")
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.started()), 1)
+        self.assertFalse(os.path.exists(lock))
+
+    def test_cdpath_leads_neither_the_script_nor_bin_python_astray(self):
+        # With CDPATH set, cd looks there first, and with "." in it (a common setting) dash and bash print where they
+        # went: the real bin/python starts with rt=$(cd "$(dirname "$0")/.." && pwd -P), which then held the path
+        # twice, and the program could not start (measured). The script was started as "sh <folder>/start_gui.sh".
+        self.make_bundle('#!/bin/sh\nrt=$(cd "$(dirname "$0")/.." && pwd -P)\n'
+                         'case $rt in *"\n"*) rt="(the path twice)" ;; esac\n'
+                         'echo "$(pwd)|$rt|$*" >> started.log\nexec sleep 3\n')
+        name = os.path.basename(self.project)
+        decoy = tempfile.mkdtemp(prefix="decoy_", dir=SANDBOX)
+        os.mkdir(os.path.join(decoy, name))                           # another folder of the same name
+        for cdpath in (f".:{decoy}", f"{decoy}:."):
+            with self.subTest(CDPATH=cdpath):
+                open(os.path.join(self.project, "started.log"), "w").close()
+                result = subprocess.run(
+                    ["sh", os.path.join(name, "start_gui.sh")], cwd=os.path.dirname(self.project),
+                    env={"PATH": self.tools, "DISPLAY": ":0", "CDPATH": cdpath},
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(self.started(), [f"{self.project}|{self.unpacked}|-m xdownloader"])
+                self.assertEqual(os.listdir(os.path.join(decoy, name)), [])
 
 
 if __name__ == "__main__":

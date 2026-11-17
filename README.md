@@ -114,8 +114,10 @@ in `gui_startup.log`.
 
 Main window:
 
-- Queue box: one URL per line. The header counts the valid ones ("Download Queue (N valid URL(s) entered)").
-  The queue is saved to `list.txt` when you close the window and loaded again on the next start.
+- Queue box: one URL per line. The header counts the valid ones ("Download Queue (N valid URL(s) entered)"): links to
+  X posts, broadcasts and Spaces, and `t.co` short links; X's home page or a profile page does not count. Other lines
+  (a note, a link to another site) are not downloaded and stay in the box. The queue is saved to `list.txt` as shown
+  when you close the window and loaded again on the next start.
 - Right-click the queue box for **Paste URL** and **Clear List**; the **Clear List** button empties the box too.
 - **Settings** opens the Settings window (below).
 - **Download** and **Stop** are the same button (Step 3). While yt-dlp is checked for updates at startup it reads
@@ -160,6 +162,8 @@ variables in it are expanded like in a shell; a folder picked with Browse is tak
   switch tabs or start a download; merely clicking elsewhere only shows a hint.
 - If the saved folder is missing at startup (external drive not connected), the project folder is used for this run and
   your choice is kept in `settings.json` until you pick another folder.
+- The project folder itself (the default) is saved as an empty `download_dir`, not as a path: a copied, moved or renamed
+  project folder keeps downloading into itself.
 
 ---
 
@@ -184,9 +188,12 @@ variables in it are expanded like in a shell; a folder picked with Browse is tak
   The tests (`tests/test_secret_guard.py`) run the same check on every tracked file and run both hooks in a throwaway
   repository. Skipping the hooks on purpose takes `--no-verify`, and GitHub's web upload never runs them.
 - **Short links** (`https://t.co/...`) can lead to any website, not only to X: yt-dlp follows them as they are. When the
-  cookies come from your browser, yt-dlp holds all of the browser's cookies, so on that website it is logged in as you,
-  as your browser would be (each cookie still goes only to its own website). Paste short links only from sources you
-  trust; when in doubt, open the link in the browser first and paste the X address it leads to.
+  cookies come from Chrome, Chromium, Brave, Opera, Edge or Vivaldi, yt-dlp holds all of that browser's cookies, so on
+  that website it is logged in as you, as your browser would be (each cookie still goes only to its own website). From
+  Firefox it gets X's cookies only: the program copies them for each download into a private temporary folder (in
+  `$XDG_RUNTIME_DIR`, or in the temporary folder where that is not set) and deletes the copy when the download ends.
+  Paste short links only from sources you trust; when in doubt, open the link in the browser first and paste the X
+  address it leads to.
 
 ---
 
@@ -326,7 +333,8 @@ CA list and Tcl/Tk paths that `bin/python` exports for itself (`system.host_env(
 
 - **Add a site**: append a `Site(...)` to `SITES` in `sites.py` (see `X` as the template). URL filtering, normalizing,
   cookie detection and "retrying cannot help" errors are all driven by its fields. Optional fields:
-  `cookies_name` (defaults to `cookies_<domain>.txt`; X keeps `cookies.txt`), `keep_query`.
+  `cookies_name` (defaults to `cookies_<domain>.txt`; X keeps `cookies.txt`), `canonical_url` (the part of a URL to keep;
+  when set, it also decides which of the site's URLs count: X's profile pages do not), `keep_query`.
   Add the site's `login_hint` to `LOG_ARG_TRANSLATIONS` in `i18n.py` as well (`tests/test_i18n.py` fails until you do).
 - **Add a language**: add it to `Config.SUPPORTED_LANGUAGES`, then add its entries to `LANGUAGE_OPTIONS`,
   `TRANSLATIONS`, `LOG_TRANSLATIONS` and `LOG_ARG_TRANSLATIONS` in `i18n.py` (data only, no code). `tests/test_i18n.py`

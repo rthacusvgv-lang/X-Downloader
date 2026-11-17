@@ -62,6 +62,9 @@ class DownloaderCore:
             Config.YT_DLP_EXE,
             # Otherwise yt-dlp also reads a yt-dlp.conf from the -P folder, which may be shared with other people.
             "--ignore-config",
+            # Its progress comes as updates separated by \r, which the log would show as one line each (hundreds per
+            # failed attempt, pushing yt-dlp's error out of the log panel). Nothing here shows progress.
+            "--no-progress",
             "-f", Config.FORMAT,
             "-S", Config.FORMAT_SORT,
             "-N", str(Config.CONCURRENT_FRAGMENTS),
@@ -79,19 +82,6 @@ class DownloaderCore:
         ])
         return cmd
 
-    def _build_cmd(self, url: str, site: Site) -> list[str]:
-        return self._base_cmd(url, self.cookies_for(site).get_cookie_args())
-
-    def _build_fallback_cmd(self, url: str, site: Site) -> list[str] | None:
-        # Only meaningful when yt-dlp was reading Firefox directly: export the cookies
-        # ourselves and retry with a plain cookies file.
-        mgr = self.cookies_for(site)
-        if not mgr.is_using_browser("firefox"):
-            return None
-        if mgr.export_firefox_cookies():
-            return self._base_cmd(url, ["--cookies", mgr.cookies_file])
-        return None
-
     def run(self, url: str) -> bool:
         """Downloads one URL. Raises ShutdownRequested if the application is closing."""
         self.network_failure = False        # an answer about this URL only, also when it is turned away below
@@ -105,16 +95,17 @@ class DownloaderCore:
         if url != original_url:
             self._logger.info("🔗 URL normalized: %s → %s", original_url, url)
 
-        cmd = self._build_cmd(url, site)
+        cookies = self.cookies_for(site)
         non_retryable = Config.NON_RETRYABLE_PATTERNS + list(site.non_retryable)
 
         for attempt in range(1, Config.MAX_RETRIES + 1):
             self._logger.info("[%d/%d] Preparing download: %s", attempt, Config.MAX_RETRIES, url)
             try:
-                result = ProcessManager.run(
-                    cmd, check=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                )
+                with cookies.cookie_args() as cookie_args:        # for Firefox: a copy that lives as long as this run
+                    result = ProcessManager.run(
+                        self._base_cmd(url, cookie_args), check=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
                 if result.stderr:
                     for line in result.stderr.strip().splitlines():
                         self._logger.debug("  yt-dlp: %s", line)
@@ -146,7 +137,8 @@ class DownloaderCore:
                         if line.strip():
                             self._logger.warning("  yt-dlp: %s", line.strip())
 
-                if site.login_error and site.login_error in errors:
+                # Only for a guest: with the login cookies sent, X's answer means what it says (no video there).
+                if site.login_error and site.login_error in errors and not cookies.get_cookie_args():
                     self._logger.error(
                         "💡 Hint: This error usually means you are not logged into %s.", site.name
                     )
@@ -157,15 +149,6 @@ class DownloaderCore:
                         "⚠️ Unrecoverable error detected, skipping retries: %s", url
                     )
                     return False
-
-                if attempt == 1 and attempt < Config.MAX_RETRIES:
-                    fallback_cmd = self._build_fallback_cmd(url, site)
-                    if fallback_cmd:
-                        self._logger.info(
-                            "🔄 Trying fallback: using directly exported cookies..."
-                        )
-                        cmd = fallback_cmd
-                        continue
 
                 # No .part cleanup here: yt-dlp resumes its own partial files, and the download
                 # folder may also hold other programs' partial downloads.

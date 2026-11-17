@@ -1,4 +1,5 @@
 """Auto-detects installed browsers and extracts the login cookies of a Site."""
+import contextlib
 import logging
 import os
 import re
@@ -16,7 +17,11 @@ from .system import ProcessManager, ShutdownRequested, atomic_write_lines
 
 _SNAPSHOT_TRIES = 3   # attempts to get a consistent copy of a live browser database
 _SNAPSHOT_PREFIX = "xdl-cookies-"
-_SNAPSHOT_MAX_AGE = 600   # seconds; a copy lives for a second or two, so an older one was left by a killed run
+# Seconds. A copy of a database lives for a second or two, and the copy of Firefox's login that cookie_args() makes
+# for yt-dlp as long as one run of it: one instance runs one at a time, so an older copy was left by a killed run. Only
+# a second instance of the program from another project folder can meet a run of over 10 minutes; yt-dlp has read its
+# copy at the start by then, and saving its cookie jar back at the end fails, so that download is simply tried again.
+_SNAPSHOT_MAX_AGE = 600
 
 
 def _xdg_config_home() -> str:
@@ -47,6 +52,12 @@ def _remove_stale_snapshots(folder: str):
                 shutil.rmtree(entry.path, ignore_errors=True)
         except OSError:
             pass
+
+
+# SQL for the current time in seconds since 1970, and for the expiry of a Firefox cookie in the same unit: Firefox 142
+# (database schema 16) stores milliseconds, earlier versions seconds (yt-dlp reads it the same way). 0 or NULL: none.
+_NOW_SQL = "CAST(strftime('%s', 'now') AS INTEGER)"
+_FIREFOX_EXPIRY_SQL = "(expiry / CASE WHEN (SELECT user_version FROM pragma_user_version) >= 16 THEN 1000 ELSE 1 END)"
 
 
 def _host_sql(column: str, domains: tuple[str, ...]) -> str:
@@ -176,14 +187,19 @@ class BrowserCookieManager:
         return []  # unreachable: the last attempt returns or raises
 
     def _db_has_login(self, browser: str, db_path: Path) -> bool:
+        """True if *db_path* holds the site's login cookie and it has not expired: a browser nobody has opened since its
+        login ran out still keeps the cookie, and must not win over a valid cookies file or another browser."""
         if browser == "firefox":
             table, column = "moz_cookies", "host"
+            unexpired = f"(expiry IS NULL OR expiry = 0 OR {_FIREFOX_EXPIRY_SQL} > {_NOW_SQL})"
         else:
-            # Cookie names are stored unencrypted in Chromium databases.
+            # Cookie names are stored unencrypted in Chromium databases. expires_utc counts microseconds since
+            # 1601-01-01 (11644473600 s before 1970); 0 is a session cookie.
             table, column = "cookies", "host_key"
+            unexpired = f"(expires_utc = 0 OR expires_utc > ({_NOW_SQL} + 11644473600) * 1000000)"
         sql = (f"SELECT COUNT(*) FROM {table} "
                f"WHERE {_host_sql(column, self.site.cookie_domains)} "
-               f"AND name = '{self.site.login_cookie}'")
+               f"AND name = '{self.site.login_cookie}' AND {unexpired}")
         try:
             return self._query_copy(db_path, sql)[0][0] > 0
         except (sqlite3.Error, OSError, IndexError) as e:
@@ -226,56 +242,72 @@ class BrowserCookieManager:
             "CASE WHEN host LIKE '.%' THEN 'TRUE' ELSE 'FALSE' END, "
             "path, "
             "CASE WHEN isSecure THEN 'TRUE' ELSE 'FALSE' END, "
-            "COALESCE(expiry, 0), name, value "
+            f"COALESCE({_FIREFOX_EXPIRY_SQL}, 0), name, value "       # a cookies file counts seconds
             f"FROM moz_cookies WHERE {_host_sql('host', self.site.cookie_domains)}"
         )
 
-    def export_firefox_cookies(self) -> bool:
-        if self._detected_browser == "firefox" and self._detected_profile:
-            candidates = [Path(self._detected_profile) / "cookies.sqlite"]
-        else:
-            candidates = self._cookie_dbs("firefox")
+    def _export_firefox_cookies(self, db_path: Path, path: str) -> bool:
+        """Writes the site's cookies of the Firefox database *db_path* to *path* (Netscape format, 0600).
 
-        for db_path in candidates:
-            try:
-                rows = self._read_firefox_cookies(db_path)
-            except (sqlite3.Error, OSError) as e:
-                self._logger.debug("Failed to read Firefox cookies: %s", e)
+        False if they hold no login cookie, or cannot be read or written.
+        """
+        try:
+            rows = self._read_firefox_cookies(db_path)
+        except (sqlite3.Error, OSError) as e:
+            self._logger.debug("Failed to read Firefox cookies: %s", e)
+            return False
+        if self.site.login_cookie not in {row[5] for row in rows}:
+            return False
+
+        lines = [
+            "# Netscape HTTP Cookie File",
+            f"# Auto-exported from Firefox - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+        ]
+        for row in rows:
+            fields = [str(c) for c in row]
+            # Tabs / newlines inside a field would corrupt the Netscape format.
+            if any(ch in fld for fld in fields for ch in "\t\r\n"):
                 continue
-
-            if self.site.login_cookie not in {row[5] for row in rows}:
-                continue
-
-            lines = [
-                "# Netscape HTTP Cookie File",
-                f"# Auto-exported from Firefox - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                "",
-            ]
-            for row in rows:
-                fields = [str(c) for c in row]
-                # Tabs / newlines inside a field would corrupt the Netscape format.
-                if any(ch in fld for fld in fields for ch in "\t\r\n"):
-                    continue
-                lines.append('\t'.join(fields))
-            try:
-                # 0600: the file contains the account session token.
-                atomic_write_lines(self.cookies_file, lines, mode=0o600)
-            except OSError as e:
-                self._logger.warning("⚠️ Cannot write %s: %s", self.site.cookies_name, e)
-                return False
-
-            self._logger.info(
-                "✅ Auto-exported %d %s cookies from Firefox", len(rows), self.site.name
-            )
-            return True
-
-        return False
+            lines.append('\t'.join(fields))
+        try:
+            # 0600: the file contains the account session token.
+            atomic_write_lines(path, lines, mode=0o600)
+        except OSError as e:
+            self._logger.warning("⚠️ Cannot write %s: %s", path, e)
+            return False
+        return True
 
     def get_cookie_args(self) -> list[str]:
         """Returns the yt-dlp cookie arguments resolved by ensure_cookies()."""
         if self._cookie_args is None:
             self.ensure_cookies()
         return list(self._cookie_args or [])
+
+    @contextlib.contextmanager
+    def cookie_args(self):
+        """Yields the yt-dlp cookie arguments for one run of yt-dlp: those of get_cookie_args(), except for Firefox.
+
+        yt-dlp reads Firefox's cookies.sqlite but not its write-ahead log, where a login of the last minutes still is.
+        So for Firefox they name a copy of the site's cookies made right now from both, in a private folder that is
+        deleted when the run ends: the copy holds the session token. (The project's cookies file is the user's and is
+        never written.) Without a copy, yt-dlp reads Firefox itself.
+        """
+        args = self.get_cookie_args()
+        if self._detected_browser != "firefox" or not self.is_using_browser("firefox"):
+            yield args
+            return
+        try:
+            private = tempfile.TemporaryDirectory(prefix=_SNAPSHOT_PREFIX, dir=_snapshot_folder(),
+                                                  ignore_cleanup_errors=True)
+        except OSError as e:
+            self._logger.warning("⚠️ Cannot write %s: %s", _snapshot_folder(), e)
+            yield args
+            return
+        with private as folder:
+            path = os.path.join(folder, "cookies.txt")
+            exported = self._export_firefox_cookies(Path(self._detected_profile) / "cookies.sqlite", path)
+            yield ["--cookies", path] if exported else args
 
     def is_using_browser(self, browser: str) -> bool:
         args = self._cookie_args or []
@@ -288,8 +320,8 @@ class BrowserCookieManager:
 
         if browser:
             spec = self._browser_spec(browser, self._detected_profile)
-            # Firefox cookies are plain sqlite: no probe needed (DownloaderCore.run exports a
-            # cookies.txt as fallback if yt-dlp still cannot read them). Chromium's are encrypted.
+            # Firefox cookies are plain sqlite: no probe needed, cookie_args() copies them for every run of yt-dlp.
+            # Chromium's are encrypted: only yt-dlp can read them.
             if browser == "firefox" or self._test_browser_cookies(spec):
                 self._logger.info(
                     "✅ Browser cookies available (%s), will be used automatically", browser
